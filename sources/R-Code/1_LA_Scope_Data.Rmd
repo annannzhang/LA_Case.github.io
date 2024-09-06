@@ -1,0 +1,316 @@
+---
+title: "Scope & Data Sources "
+output: 
+  html_document:
+    theme: cosmo
+    code_folding: hide
+    toc: false
+    css: "css/R_Knit.css"
+knitr:
+  opts_chunk:
+    echo: FALSE
+---
+
+
+```{r setup, include=FALSE}
+library(tidycensus)
+library(tidyverse)
+library(dplyr)
+library(sf)
+library(kableExtra)
+library(ggplot2)
+library(plotly)
+library(readxl)
+library(devtools)
+library(readr)
+library(leaflet)
+library(leaflet.extras)
+library(dbscan)
+#devtools::install_github("GIScience/openrouteservice-r")
+library(openrouteservice)
+library(geosphere)
+library(magrittr)
+#remotes::install_github('rstudio/DT')
+library(DT)
+
+census_api_key("b3abcecc231fa30ccaa18cb5e854c30f1982fe3f", overwrite = TRUE, install = TRUE)
+readRenviron("~/.Renviron")
+```
+
+```{r, warning=FALSE, message=FALSE, results='hide', include=FALSE}
+
+LA_Permits <- read_excel("./data/excel/Building_and_Safety_Permits.xlsx")
+CPA_Geo <- st_read("./data/shapefiles/Community_Plan_Areas_(CPA)/Community_Plan_Areas_(CPA).shp")
+City_Geo <- st_read("./data/shapefiles/City_Boundary/City_Boundary.shp")
+Dev_Permits <- LA_Permits %>% filter(PERMIT_TYPE == "Bldg-Addition" | PERMIT_TYPE == "Bldg-New" | PERMIT_TYPE == "Bldg-Demolition")
+
+
+Use_Desc_Match <- read.csv("./Use_Desc_Match.csv") %>% select(Cat_1, Cat_2)
+ZHVI_Raw <- read.csv("./ZHVI.csv")
+Neighborhood <- st_read("./Neighborhood/Neighborhood_Demographics.shp") %>% st_transform(st_crs(CPA_Geo))
+```
+Overall, data from 3 sources are primary contributors to this study -- building permits data published by the City of LA, officially established neighborhood geography (shapefile), and Census data.
+<br>
+<br>
+
+## **1) Permits Data**
+
+The primary data used in this study for analyzing development in the city is building permits from the start of 2010 to July 1st, 2022. To better fit the purpose of this study, a part of permits are filtered out due to their small scope that doesn't help indicate development at neighborhood or city scale. The permits data underwent the following three filtering processes before being analyzed:
+<br>
+
+1.  Given the permits data consists of various types, of which not all directly indicate development in the city, **this study focuses on three types of permits -- Building Addition, Building Demolition, and New Building**. Demolition is included because it may suggest interest in new development.
+
+```{r, include=FALSE}
+
+
+Stats_1 <- data.frame(Permits = "Permits",
+                      Other_Permits = nrow(LA_Permits)-nrow(Dev_Permits),
+                      Development_Permits = nrow(Dev_Permits))
+
+Stats_1_fig <- plot_ly(Stats_1, x=~Development_Permits, y=~Permits,
+                       name='Development Permits (Scope of Analysis)',
+                       type = 'bar', 
+                       orientation = 'h', 
+                       marker = list(color='rgba(112, 207, 203, 0.6)',
+                                     line = list(color = 'rgba(112, 207, 203, 1)',
+                                            width=3)))
+
+Stats_1_fig <- Stats_1_fig %>% add_trace(x=~Other_Permits, 
+                         name='Other Permits', 
+                         marker = list(color='rgba(0, 57, 84, 0.6)',
+                         line = list(color = 'rgba(0, 57, 84, 1.0)',
+                                     width=3))) 
+
+Stats_1_fig <- Stats_1_fig%>% layout(barmode="stack",
+                      title = "Permits in the City of Los Angeles (2010-2022)",
+                      xaxis = list(title = 'Counts'),
+                      yaxis = list(title = '', showticklabels = FALSE),
+                      showlegend=TRUE, margin=0.5)
+
+Stats_1_fig <- Stats_1_fig %>% 
+  add_annotations(xref = 'Dev', yref = 'Permits',
+                  x = Stats_1$Development_Permits/2 , 
+                  y = Stats_1$Permits,
+                  text = paste(sprintf("%.2f", Stats_1$Development_Permits / nrow(LA_Permits) * 100), '%'),
+                  font = list(color='rgba(255,255,255,1)', size = 15),
+                  showarrow = FALSE)
+
+Stats_1_fig <- Stats_1_fig %>% 
+  add_annotations(xref = 'Others', yref = 'Permits',
+                  x = Stats_1$Other_Permits/2 + Stats_1$Development_Permits, 
+                  y = Stats_1$Permits,
+                  text = paste(sprintf("%.2f", Stats_1$Other_Permits / nrow(LA_Permits) * 100), '%'),
+                  font = list(color='rgba(255,255,255,1)', size = 15),
+                  showarrow = FALSE)
+
+```
+
+```{r, fig.width=10, echo=FALSE, fig.align='center'}
+Stats_1_fig
+```
+<br>
+<br>
+
+2.  The permits come in 322 use types. In this study, **only use types that appeared for more than 5 times are being taken into consideration, which cuts use types down to 91.** Use types with very low frequency of appearance (1-4 times) may suggest development in uncommon use, which is not primary focus of this study. The total permit entries is reduced from 126,861 to 126,009.
+
+```{r, include=FALSE}
+#kable table
+Use_Type <- Dev_Permits %>% group_by(USE_DESC) %>% count()
+Use_Type <- Use_Type %>%
+  arrange(desc(n)) %>% 
+  rename(c('Use Type' = 'USE_DESC'), c('Counts' = 'n'))
+
+Stats_2 <- datatable(Use_Type)
+```
+
+```{r, echo=FALSE, fig.align='center'}
+Stats_2
+```
+<br>
+<br>
+
+3.  Additionally, the use types are **aggregated from 91 to 11: residential, commercial, educational, religious, recreational, infrastructure & utilities, public services (including police, medical office, etc.), office, hotels, manufacturing, and others.** This is a piece of information that helps better understand the types of development happening in neighborhoods. In most of the analysis, 'others' is excluded, since the majority of this type of permits are at smaller and personal scales, such as building garage or swimming pool, as oppose to larger projects with more community impact. 
+
+```{r, include=FALSE}
+# Filter out frequency <= 4
+Use_Desc_Filt <- Dev_Permits %>% 
+  group_by(USE_DESC) %>%
+  count() %>%
+  filter(n >= 5)
+
+# limit study scope to those: 
+Dev_Permits_New <- Dev_Permits %>% filter(USE_DESC %in% Use_Desc_Filt$USE_DESC)
+
+# Aggregate into 11 categories
+Use_Desc_Filt <- Use_Desc_Filt %>% merge(Use_Desc_Match, by.x="USE_DESC", by.y="Cat_1")
+
+Use_Agg <- Use_Desc_Filt %>% group_by(Cat_2) %>% summarize(Counts = sum(n))
+Non_residential <- Use_Agg %>% 
+  filter(Cat_2 != "Residential") %>% 
+  summarize(Cat_2 = "Non-Residential", Counts = sum(Counts))
+
+Res_Non_Res <- bind_rows(Use_Agg %>% filter(Cat_2 == "Residential"), Non_residential)
+Non_Res_Only <- Use_Agg %>% filter(!(Cat_2 %in% c("Residential", "Non-Residential")))
+```
+
+```{r, include=FALSE}
+c11 <- c('#d2d2cb', "#eba5c7", "#9cb1c4", 
+         "#b3afc6","#172d62","#d6cabc", "#003954", "#468eca",'#A8D0DB',"#beebff","#16b7b1")
+
+Stats_3 <- plot_ly()
+Stats_3 <- Stats_3 %>% add_pie(hole = 0.4, data = Use_Agg, labels = ~Cat_2, values = ~Counts, showlegend=T,
+                              marker = list(colors = c11),
+                               title="Permits Breakdown")
+```
+
+```{r, echo=F, fig.align='center'}
+Stats_3
+```
+<br>
+<br>
+
+## **2) Neighborhood Geography** 
+<br>
+The development pattern is analyzed at Neighborhood level, which is more granular than Community Plan Area but less than census tract. Despite CPAs being the officially established geographic unit for strategic planning and implementation, neighborhood identified on LA's geohub (official GIS platform) is chosen for two primary reasons -- 1) it is more granular than CPA and closer to local recognition / understanding of cluster of population from similar cultural and socio-economic background, and 2) it better aligns with other types of geo-division for analysis, such as census tracts and neighborhood identified in Zillow Housing Value Index. Undoubtedly, it is possible to associate neighborhood used here with officially established CPA for future planning, if necessary.
+
+**Neighborhood Data is obtained from city's GeoHub: <https://geohub.lacity.org/search?collection=Dataset&q=neighborhoods>.** <br>
+**For more information about CPA, visit <https://planning.lacity.gov/plans-policies/community-plans>.**
+
+**The following map displays different methods for geo unit division.**
+
+<br>
+```{r, include=FALSE}
+Tracts <- get_acs(
+  geography = "tract",
+  variables = c("B25026_001"),
+  year=2022,
+  state=06,
+  county=037,
+  geometry=TRUE
+  )
+Tracts <- Tracts %>% st_transform(st_crs(City_Geo))
+                           
+
+bbox <- st_bbox(City_Geo)   
+LA_Map <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  # Census Tracts
+  addPolygons(data=Tracts, 
+              color = "#b3afc6", 
+              weight = 0.7, 
+              group="Census Tracts") %>%
+   # City Boundary
+  addPolygons(data=City_Geo, 
+              color = "#eba5c7", 
+              weight=2, 
+              fillColor="#ffffff", 
+              group="City Boundary") %>%
+  # CPA
+  addPolygons(data=CPA_Geo, 
+              color="#003954",
+              fillColor="#ffffff",
+              opacity = 1,
+              weight = 1.2,
+              label= paste(CPA_Geo$NAME_ALF) %>% lapply(htmltools::HTML),
+              group="CPA") %>%
+  # Neighborhood
+  addPolygons(data=Neighborhood, 
+              color="#70cfcb",
+              weight=0.5, 
+              opacity=1, 
+              label= paste(Neighborhood$name) %>%lapply(htmltools::HTML), 
+              group="Neighborhood") %>%
+  addLayersControl(overlayGroups = c("Census Tracts", "City Boundary", "CPA", "Neighborhood"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("Census Tracts") %>%
+  hideGroup("CPA") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+
+```
+
+```{r, echo=F, fig.align='center'}
+LA_Map
+```
+<br>
+<br>
+
+## **3) Census (2010-2022)** 
+
+For population growth: <br>
+Census data used in this study include 1) ACS 5-year estimate for population from 2010 to 2022 and 2) Job related estimates from Census on the map. Most CPA boundaries well aligns with census tracts, granting a relatively easy pairing process. For the purpose of simplification, for those that have minor discrepancies, if one census tracts has more than 75% of its area falling in one CPA, then the whole tract will be counted into that CPA. 
+For job growth: <br>
+Census on The Map (https://onthemap.ces.census.gov/) provides workforce data at census tracts at most granular scale. Census tracts data is downloaded, then a spatial join is conducted to match with neighborhoods. For most case, neighborhood boundary and census tracts align well. 
+<br>
+<br>
+
+## **4) Zillow Housing Value Index (ZHVI) (Additional Information)**
+
+Zillow Housing Value Index at neighborhood level is used as an additional piece of information for reference. Source: <https://www.zillow.com/research/data/>
+
+ZHVI dataset does not come with geo information, and some names / categorization does not fully align with the official neighborhood divisions. Hence, instead of inputting this as a part of analytic model, the ZHVI is used as an additional piece of information that may help with understanding the development in each neighborhood. 
+
+Top 10 and bottom 10 for growth rate from the start of 2010 till end of 2022.
+
+(Click on neighborhood name or line to turn on/off )
+
+<br>
+<br>
+
+```{r, include=F}
+LA_ZHVI <- ZHVI_Raw %>% filter(City == "Los Angeles")
+
+
+LA_ZHVI_Top_10 <- LA_ZHVI %>% 
+  mutate(change_10_22 = (X2022.12.31 - X2009.12.31)/ X2009.12.31*100) %>% 
+  top_n(10) %>% select(-RegionID, -SizeRank, 
+                       -RegionType, -StateName, 
+                       -State, -City, -Metro, -CountyName)
+
+LA_ZHVI_Bottom_10 <- LA_ZHVI %>% 
+  mutate(change_10_22 = (X2022.12.31 - X2009.12.31)/ X2009.12.31*100) %>% 
+  top_n(-10) %>% select(-RegionID, -SizeRank, 
+                       -RegionType, -StateName, 
+                       -State, -City, -Metro, -CountyName)
+
+
+LA_ZHVI_Select <- rbind(LA_ZHVI_Top_10, LA_ZHVI_Bottom_10)
+
+for (i in 2010:2022){
+
+col_name <- paste0("avg_", i)
+LA_ZHVI_Select <- LA_ZHVI_Select %>% mutate(
+ !!col_name := rowMeans(select(., contains(as.character(i))), na.rm = TRUE)
+)
+
+}
+
+
+LA_ZHVI_Select <- LA_ZHVI_Select %>% 
+  select(RegionName, contains(as.character('avg'))) %>% 
+  pivot_longer(cols=!RegionName, names_to = "Time", values_to="Value") 
+
+LA_ZHVI_Select$Years = substr(LA_ZHVI_Select$Time, 5, 8)
+
+Stats_4 <- plot_ly(LA_ZHVI_Select, 
+                   type = "scatter", 
+                   mode = "lines+markers",
+                   x = ~Years,
+                   y= ~Value,
+                 split = ~RegionName) %>%
+  layout(title = "Annual Mean House Value by Neighborhood (2010-2022) by ZHVI"
+         )
+
+```
+
+```{r, echo=F, fig.align='center'}
+Stats_4
+```
+
+
+<br>
+<br>
+<br>
+<br>

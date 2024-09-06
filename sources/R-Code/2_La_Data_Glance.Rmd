@@ -1,0 +1,843 @@
+---
+title: "Data at a Glance: Development in Los Angeles, 2010-2022"
+output: 
+  html_document:
+    css: "css/R_Knit.css"
+    theme: cosmo
+    code_folding: hide
+    toc: no
+    toc_float:
+      collapsed: true
+knitr:
+  opts_chunk:
+    echo: FALSE
+---
+
+```{r setup, include=FALSE}
+library(tidycensus)
+library(tidyverse)
+library(dplyr)
+library(sf)
+library(kableExtra)
+library(ggplot2)
+library(plotly)
+library(readxl)
+library(devtools)
+library(readr)
+library(leaflet)
+library(leaflet.extras)
+library(dbscan)
+#devtools::install_github("GIScience/openrouteservice-r")
+library(openrouteservice)
+library(geosphere)
+library(magrittr)
+#remotes::install_github('rstudio/DT')
+library(DT)
+library(shiny)
+
+census_api_key("b3abcecc231fa30ccaa18cb5e854c30f1982fe3f", overwrite = TRUE, install = TRUE)
+readRenviron("~/.Renviron")
+```
+
+```{r, warning=FALSE, message=FALSE, results='hide', include=FALSE}
+
+LA_Permits <- read_excel("./data/excel/Building_and_Safety_Permits.xlsx")
+CPA_Geo <- st_read("./data/shapefiles/Community_Plan_Areas_(CPA)/Community_Plan_Areas_(CPA).shp")
+City_Geo <- st_read("./data/shapefiles/City_Boundary/City_Boundary.shp")
+Dev_Permits <- LA_Permits %>% filter(PERMIT_TYPE == "Bldg-Addition" | PERMIT_TYPE == "Bldg-New" | PERMIT_TYPE == "Bldg-Demolition")
+
+
+Use_Desc_Match <- read.csv("./Use_Desc_Match.csv") %>% select(Cat_1, Cat_2)
+ZHVI_Raw <- read.csv("./ZHVI.csv")
+Neighborhood <- st_read("./Neighborhood/Neighborhood_Demographics.shp") %>% st_transform(st_crs(CPA_Geo))
+```
+
+```{r, eval=FALSE, include=FALSE}
+# Color Palette
+("#003954", "#16b7b1", "#eba5c7", "#9cb1c4", "#b3afc6","#beebff")
+ 
+("#468eca", "#e2a7c5", "#172d62", "#d1c47d") 
+
+("#e7b4dd", "#d6cabc", "#70cfcb", "#067adf", "#01608e")
+
+
+```
+
+This part closely looks at each indicator that goes in the index modeling for determining development patterns, through temporal and geographic lenses. 
+
+# **Tier 1: Permits Finaled / CoO Issued**
+Number of Development Permits Finaled or Certificate of Occupancy
+    Issued (indicating projects that are considered finished, and hence
+    would have real merit and impacts to neighborhood)
+
+```{r, include=F}
+# Filter out frequency <= 4
+Use_Desc_Filt <- Dev_Permits %>% 
+  group_by(USE_DESC) %>%
+  count() %>%
+  filter(n >= 5)
+
+# limit study scope to frequency >5 and add new category
+Dev_Permits_New <- Dev_Permits %>% 
+  filter(USE_DESC %in% Use_Desc_Filt$USE_DESC) %>% 
+  merge(Use_Desc_Match, by.x="USE_DESC", by.y="Cat_1") %>%
+  rename(c('Category' = 'Cat_2'))
+
+# Geocode
+Dev_Permits_New_Geo <- Dev_Permits_New %>% drop_na(LON) %>% st_as_sf(coords = c("LON", "LAT"), crs = 4326)
+Dev_Permits_New_Geo <- Dev_Permits_New_Geo %>% st_join(Neighborhood %>% select(name, geometry)) %>% rename(c('COMMUNITY' = 'name'))
+Dev_Permits_New_Other <- Dev_Permits_New %>% 
+  filter(is.na(LON)) %>% 
+  merge(Neighborhood %>% 
+  st_drop_geometry() %>% select(name), by.x = "CNC", by.y="name", all.x=TRUE) %>% drop_na(CNC)
+
+Dev_Permits_New_Other <- Dev_Permits_New_Other %>% 
+  mutate(COMMUNITY = case_when(CNC == "Woodland Hills - Warner Center" ~ "Woodland Hills",
+                   CNC == "Wilshire Center - Koreatown" ~ "Wilshire Center",
+                   CNC == "Westside" ~ "Century City",
+                   CNC == "Westchester - Playa del Rey" ~ "Westchester",
+                   CNC == "Untd Nghbrhds of Hstrc Arlington Hghts/W Adam" ~ "Jefferson Park",
+                   CNC == "South Robertson" ~ "Cadillac-Corning",
+                   CNC == "Silver Lake" ~ "Silverlake",
+                   CNC == "Rampart Village" ~ "Temple-Beaudry",
+                   CNC == "Pico Union" ~ "Pico-Union",
+                   CNC == "P.I.C.O." ~ "Pico-Union",
+                   CNC == "Olympic Park" ~ "Koreatown",
+                   CNC == "Northwest San Pedro" ~ "San Pedro",
+                   CNC == "Northridge West" ~ "Northridge",
+                   CNC == "North Hills East" ~ "North Hills",
+                   CNC == "Mid-Town North Hollywood" ~ "North Hollywood",
+                   CNC == "Mid City West" ~ "Mid-city",
+                   CNC == "Mid City" ~ "Mid-city",
+                   CNC == "MacArthur Park" ~ "Westlake",
+                   CNC == "Hollywood United" ~ "Hollywood",
+                   CNC == "Hollywood Hills West" ~ "Hollywood Hills",
+                   CNC == "Historic Highland Park" ~ "Highland Park",
+                   CNC == "Historic Cultural" ~ "Wholesale District",
+                   CNC == "Harbor Gateway North" ~ "Harbor Gateway",
+                   CNC == "Greater Wilshire" ~ "Melrose",
+                   CNC == "Greater Valley Glen" ~ "North Hollywood",
+                   CNC == "Greater Echo Park Elysian" ~ "Echo Park",
+                   CNC == "Greater Cypress Park" ~ "Atwater Village",
+                   CNC == "Empowerment Congress North Area" ~ "Exposition Park",
+                   CNC == "Elysian Valley Riverside" ~ "Elysian Valley", 
+                   CNC == "Central Hollywood" ~ "Hollywood",
+                   TRUE ~ CNC
+                   ))
+
+
+Dev_Permits_Neighbor <- rbind(Dev_Permits_New_Geo %>% st_drop_geometry(), Dev_Permits_New_Other %>% select(-LAT, -LON))
+
+Dev_Permits_Neighbor <- Dev_Permits_Neighbor %>% 
+  mutate(
+    COMMUNITY = case_when(
+      PERMIT_NBR == "14014-10001-02752" ~ "Reynier Village",
+      PERMIT_NBR == "20014-10000-03244" ~ "Faircrest Heights",
+      PERMIT_NBR == "14014-10000-02752" ~ "Reynier Village",
+      PERMIT_NBR == "13019-20000-03161" ~ "Tujunga",
+      PERMIT_NBR == "13014-20000-02210" ~ "El Sereno",
+      PERMIT_NBR == "20014-20000-02325" ~ "Faircrest Heights",
+      PERMIT_NBR == "11010-10000-01197" ~ "Sylmar",
+      PERMIT_NBR == "20016-20000-28788" ~ "Faircrest Heights",
+      PERMIT_NBR == "12014-20000-02470" ~ "El Sereno",
+      PERMIT_NBR == "09010-20000-01411" ~ "Tujunga",
+      PERMIT_NBR == "20010-10000-00291" ~ "Van Nuys",
+      PERMIT_NBR == "19010-10000-05871" ~ "Los Feliz",
+      PERMIT_NBR == "19010-10000-00750" ~ "Watts",
+      TRUE ~ COMMUNITY
+    )
+  )
+
+Dev_Permits_Neighbor$Submit_Year = substr(Dev_Permits_Neighbor$SUBMITTED_DATE, 1, 4)
+Dev_Permits_Neighbor$Issued_Year = substr(Dev_Permits_Neighbor$ISSUE_DATE, 1, 4)
+```
+
+```{r, include=F}
+Finaled_Permits_N <- Dev_Permits_Neighbor %>% 
+  filter(STATUS == "Permit Finaled" | STATUS == "CofO Issued") %>%
+  mutate(ERA = ifelse(Issued_Year > 2015, "2016-2022", "2010-2015")) %>%
+  group_by(ERA, COMMUNITY, Category) %>% 
+  count()
+
+Finaled_Permits_A <- Dev_Permits_Neighbor %>% 
+  filter(STATUS == "Permit Finaled" | STATUS == "CofO Issued") %>%
+  mutate(ERA = ifelse(Issued_Year > 2015, "2016-2022", "2010-2015")) %>%
+  group_by(ERA, COMMUNITY) %>% 
+  count()
+
+Finaled_Permits_A <- left_join(Finaled_Permits_A, Neighborhood)
+Finaled_Permits_A <- st_as_sf(Finaled_Permits_A)
+
+Finaled_Permits_N <- left_join(Finaled_Permits_N, Neighborhood)
+Finaled_Permits_N <- st_as_sf(Finaled_Permits_N)
+```
+
+```{r, include=FALSE}
+pal_1 <- colorNumeric(
+  palette =  c( "#C9EAE9", "#16b7b1", "#0B7673"),  
+  domain = Finaled_Permits_A$n  
+)
+
+Tier1_map1 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Finaled_Permits_A %>% filter(ERA == "2010-2015"), 
+              fillColor = ~pal_1(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Finaled_Permits_A$COMMUNITY,  "<br>", "Finaled Permits:", n) %>% lapply(htmltools::HTML),
+              group="2010-2015") %>%
+  addPolygons(data=Finaled_Permits_A %>% filter(ERA == "2016-2022"), 
+              fillColor = ~pal_1(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight=1, 
+              label= ~paste(Finaled_Permits_A$COMMUNITY, "<br>","Finaled Permits:", n) %>%lapply(htmltools::HTML), 
+              group="2016-2022") %>%
+  addPolygons(data=City_Geo %>% st_transform(st_crs(Finaled_Permits_A)), 
+              color = "#eba5c7", 
+              weight=2, 
+              fillColor="#ffffff", 
+              group="City Boundary") %>% 
+  addLegend(pal = pal_1, 
+            values = Finaled_Permits_A$n,
+            opacity = 0.7, 
+            title = htmltools::HTML("Total Permit", "<br>", "Count"),
+            position = "bottomright"
+        ) %>%
+  addLayersControl(overlayGroups = c("2010-2015", "2016-2022", "City Boundary"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2016-2022") %>%
+  hideGroup("City Boundary") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+```
+
+```{r, include=FALSE}
+Finaled_Permits_B <- Dev_Permits_Neighbor %>% 
+  filter(STATUS == "Permit Finaled" | STATUS == "CofO Issued") %>%
+  filter(Category != "Others") %>%
+  mutate(ERA = ifelse(Issued_Year > 2015, "2016-2022", "2010-2015")) %>%
+  group_by(ERA, COMMUNITY) %>% 
+  count()
+
+Finaled_Permits_B <- left_join(Finaled_Permits_B, Neighborhood)
+Finaled_Permits_B <- st_as_sf(Finaled_Permits_B)
+
+```
+
+```{r, include=FALSE}
+pal_2 <- colorNumeric(
+  palette =  c("#DEDCEA", "#b3afc6", "#453B73"),  
+  domain = Finaled_Permits_B$n  
+)
+
+
+bbox <- st_bbox(City_Geo)   
+Tier1_map2 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Finaled_Permits_B %>% filter(ERA == "2010-2015"), 
+              fillColor = ~pal_2(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Finaled_Permits_B$COMMUNITY,  "<br>", "Finaled Permits:", n) %>% lapply(htmltools::HTML),
+              group="2010-2015") %>%
+  addPolygons(data=City_Geo %>% st_transform(st_crs(Finaled_Permits_A)), 
+              color = "#eba5c7", 
+              weight=2, 
+              fillColor="#ffffff", 
+              group="City Boundary") %>% 
+  addPolygons(data=Finaled_Permits_B %>% filter(ERA == "2016-2022"), 
+              fillColor = ~pal_2(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight=1, 
+              label= ~paste(Finaled_Permits_B$COMMUNITY, "<br>","Finaled Permits:", n) %>%lapply(htmltools::HTML), 
+              group="2016-2022") %>%
+  addLegend(pal = pal_2, 
+            values = Finaled_Permits_B$n,
+            opacity = 0.7, 
+            title = htmltools::HTML("Permits without", "<br>", "'Others'"),
+            position = "bottomright"
+        ) %>%
+  addLayersControl(overlayGroups = c("2010-2015", "2016-2022", "City Boundary"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2016-2022") %>%
+  hideGroup("City Boundary") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+```
+
+```{r, echo=FALSE}
+# two maps together
+htmltools::browsable(
+  htmltools::tagList(
+    div(style = "display: flex;",
+        div(style = "width: 50%;", Tier1_map1),
+        div(style = "width: 50%;", Tier1_map2)
+    )
+  )
+)
+```
+
+```{r, include=F}
+write.csv(Finaled_Permits_B %>% st_drop_geometry(), "./data/intermediate/Finaled_Permits.csv")
+```
+
+<br> <br> 
+
+The map on the left shows total finaled permits. However, the finaled permits include a category called 'others', which include many smaller scale and more personal projects that have less effect to the communities holistically. Therefore, 'others' are excluded in this study since they do not reflect neighborhood-scale development interest and actions. The map on the right shows the spatial pattern after taking them out, which does not vary too much from the one on the left. The left bar chart below shows the breakdown of finaled permits by type. Residential undoubtedly topped, while many other types with significantly smaller counts are less visible in the chart. To better understand the breakdown of the rest of the types, the chart on the right is created without including residential or 'other' permits. 
+
+<b>It is important to note that permit counts (including finaled, issued, and total processed) are normalized by population in each neighborhood, and area squarefootage is normalized by total area of the neighborhood (for Tier 2). Yet in this section, all data are explored raw, without normalization, to provide a fresh perspective. Aboslute number of permits also matter to a certain extent when revealing development intensity and scale. </b> This is to ensure relative equality to neighborhood with less residents or smaller in size when assessing development activities. Theoretically speaking, larger neighborhoods with more residents should expect more projects going on. 
+
+It is also evident that a few neighborhoods has experience explosion in finaled permits, while the majority stays relatively flat. The neighborhoods undergoing big increase include North Hollywood (from 1111 to 2031, excluding 'Others'), Melrose (from 1117 to 1521), and Porter Ranch (from 676 to 1289). 
+
+
+<br> <br>
+
+
+```{r, include=F}
+Finaled_Permits <- Dev_Permits_Neighbor %>% 
+  filter(STATUS == "Permit Finaled" | STATUS == "CofO Issued") %>%
+  group_by(Category, Issued_Year) %>% 
+  count()
+```
+
+```{r, include=F}
+c11 <- c('#d2d2cb', "#eba5c7", "#9cb1c4", "#b3afc6","#172d62","#d6cabc", "#003954", "#468eca",'#A8D0DB',"#beebff","#16b7b1")
+
+
+tier1_fig1 <- plot_ly(Finaled_Permits, x = ~Issued_Year, y = ~n, 
+                   color = ~Category, type = "bar", colors = c11, showlegend=TRUE) %>% 
+  layout(xaxis = list(title = 'Year'), yaxis = list(title='Number of Permits'), barmode = 'stack',
+         title = "Permits Finaled or CoO Issued, by year and category of building")
+
+```
+
+```{r, include=F}
+c9 <- c('#d2d2cb', "#eba5c7", "#9cb1c4", "#b3afc6","#172d62","#d6cabc", "#468eca",'#A8D0DB',"#beebff")
+tier1_fig2<- plot_ly(Finaled_Permits %>% filter(Category != "Residential") %>% filter(Category != "Others"), x = ~Issued_Year, y = ~n, 
+                   color = ~Category, type = "bar", colors = c9, showlegend=FALSE) %>% 
+  layout(xaxis = list(title = 'Year'), yaxis = list(title='Number of Permits'), barmode = 'stack',
+         title = "Non-Residential Permits Breakdown")
+
+# Combine two plots
+tier1_1_2_combine <- subplot(tier1_fig1, tier1_fig2, shareY = FALSE, titleX = TRUE) %>% 
+               layout(title = list(text = "Finaled Permits by Types", showlegend=TRUE), margin=0.1)
+```
+
+```{r, echo=F, fig.width=10}
+tier1_1_2_combine
+```
+
+
+<br>
+<br>
+
+# **Tier 1.5: Issued and Total Permit Counts**
+
+Number of Total Development Permit Applications Submitted (suggesting overall development interest) and <br>
+Number of Development Permits Issued (suggesting potential on-going
+    development that's approved)
+
+```{r, include=FALSE, message=F, results=F}
+complete_grid <- expand.grid(
+  ERA = c("2010-2015", "2016-2022"),
+  COMMUNITY = Neighborhood$COMMUNITY
+)
+
+Issued_Permits <- Dev_Permits_Neighbor %>% 
+  filter(STATUS == "Issued" | STATUS == "Ready to Issue") %>%
+  mutate(ERA = ifelse(Issued_Year > 2015, "2016-2022", "2010-2015")) %>%
+  group_by(ERA, COMMUNITY) %>%
+  count() %>%
+  right_join(complete_grid, by = c("ERA", "COMMUNITY"))
+
+Issued_Permits$n[is.na(Issued_Permits$n)] <- 0
+
+Total_Permits <- Dev_Permits_Neighbor %>% 
+  mutate(ERA = ifelse(Issued_Year > 2015, "2016-2022", "2010-2015")) %>%
+  group_by(ERA, COMMUNITY) %>%
+  count()
+
+Issued_Permits <- left_join(Finaled_Permits_B %>% rename(c('counts' = 'n')), Issued_Permits)
+Issued_Permits <- st_as_sf(Issued_Permits) %>% st_transform(st_crs(City_Geo))
+
+
+Total_Permits <- left_join(Total_Permits, Neighborhood)
+Total_Permits <- st_as_sf(Total_Permits)
+```
+
+
+```{r, include=FALSE}
+pal_3 <- colorNumeric(
+  palette =  c( "#E6EEF5", "#7E95A9"),  
+  domain = Issued_Permits$n  
+)
+Tier1_map5 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Issued_Permits %>% filter(ERA == "2010-2015"), 
+              fillColor = ~pal_3(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Issued_Permits$COMMUNITY,  "<br>", "Issued Permits:", n) %>% lapply(htmltools::HTML),
+              group="2010-2015") %>%
+    addPolygons(data=Issued_Permits %>% filter(ERA == "2016-2022"), 
+              fillColor = ~pal_3(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Issued_Permits$COMMUNITY,  "<br>", "Issued Permits:", n) %>% lapply(htmltools::HTML),
+              group="2016-2022") %>%
+  addPolygons(data=City_Geo %>% st_transform(st_crs(Issued_Permits)), 
+              color = "#453B73", 
+              weight=2, 
+              fillColor="#ffffff", 
+              group="City Boundary") %>% 
+  addLegend(pal = pal_3, 
+            values = Issued_Permits$n,
+            opacity = 0.7, 
+            title = htmltools::HTML("Issued Permit", "<br>", "Count"),
+            position = "bottomright"
+        ) %>%
+  addLayersControl(overlayGroups = c("2010-2015", "2016-2022", "City Boundary"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2016-2022") %>%
+  hideGroup("City Boundary") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+```
+
+
+```{r, include=FALSE}
+pal_4 <- colorNumeric(
+  palette =  c("#F2D4E3", "#B47C98"),  
+  domain = Total_Permits$n  
+)
+
+
+bbox <- st_bbox(City_Geo)   
+Tier1_map6 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Total_Permits %>% filter(ERA == "2010-2015"), 
+              fillColor = ~pal_4(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Total_Permits$COMMUNITY,  "<br>", "Finaled Permits:", n) %>% lapply(htmltools::HTML),
+              group="2010-2015") %>%
+  addPolygons(data=City_Geo %>% st_transform(st_crs(Finaled_Permits_A)), 
+              color = "#453B73" , 
+              weight=2, 
+              fillColor="#ffffff", 
+              group="City Boundary") %>% 
+  addPolygons(data=Total_Permits %>% filter(ERA == "2016-2022"), 
+              fillColor = ~pal_4(n),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight=1, 
+              label= ~paste(Total_Permits$COMMUNITY, "<br>","Total Permits:", n) %>%lapply(htmltools::HTML), 
+              group="2016-2022") %>%
+  addLegend(pal = pal_4, 
+            values = Total_Permits$n,
+            opacity = 0.7, 
+            title = htmltools::HTML("Total Permits"),
+            position = "bottomright"
+        ) %>%
+  addLayersControl(overlayGroups = c("2010-2015", "2016-2022", "City Boundary"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2016-2022") %>%
+  hideGroup("City Boundary") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+```
+
+```{r, echo=FALSE}
+# two maps together
+htmltools::browsable(
+  htmltools::tagList(
+    div(style = "display: flex;",
+        div(style = "width: 50%;", Tier1_map5),
+        div(style = "width: 50%;", Tier1_map6)
+    )
+  )
+)
+```
+
+```{r, include=F}
+write.csv(Issued_Permits %>% st_drop_geometry(), "./data/intermediate/Issued_Permits.csv")
+write.csv(Total_Permits %>% st_drop_geometry(), "./data/intermediate/Total_Permits.csv")
+```
+
+In addition to finaled permits / issued Certificate of Occupancy, which indicates finished projects that have been put in use, issued and total permit counts are great for understanding where overall development interest lies. Across time, we observe increase in both issued and total submitted permits, with the increase most significant in North Hollywood, Melrose, Encino, and Winnetka for both Issued and Total submitted permits. Again, neighborhoods in the south-east have been seeing less development and less interest in development during both time frames.
+
+<br>
+<br>
+
+# **Tier 2:  Valuation & Area**
+
+Total Valuation of All Finaled Projects Indicated on Permits Record and <br>
+Total Area (Sqft.) of All Finaled Projects Indicated on Permits Record
+
+```{r, include=F}
+Finaled_Permits_2 <- Dev_Permits_Neighbor %>% 
+  filter(STATUS == "Permit Finaled" | STATUS == "CofO Issued") %>%
+  mutate(ERA = ifelse(Issued_Year > 2015, "2016-2022", "2010-2015"),
+         SQFT = abs(SQUARE_FOOTAGE)) 
+
+Valuation <- Finaled_Permits_2 %>% 
+  group_by(COMMUNITY, ERA) %>% 
+  summarize(Value = sum(VALUATION, na.rm=TRUE)/1000000)
+          
+Valuation <- left_join(Finaled_Permits_B %>% rename(c('counts' = 'n')), Valuation)
+Valuation <- st_as_sf(Valuation)
+
+Area <- Finaled_Permits_2 %>% 
+  group_by(COMMUNITY, ERA) %>% 
+  summarize(SquareFoot = sum(SQFT, na.rm=TRUE)/1000000)
+
+Area <- left_join(Finaled_Permits_B %>% rename(c('counts' = 'n')), Area)
+Area <- st_as_sf(Area)
+```
+
+```{r, include=FALSE}
+pal_5 <- colorNumeric(
+  palette =  c('#A8D0DB',"#409BB4", "#003954"),  
+  domain = Valuation$Value
+)
+
+bbox <- st_bbox(City_Geo)   
+Tier1_map3 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Valuation %>% filter(ERA == "2010-2015"), 
+              fillColor = ~pal_5(Value),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Valuation$COMMUNITY, "<br>", "Total Value (M):", Valuation$Value) %>%
+                lapply(htmltools::HTML),
+              group="2010-2015") %>%
+  addPolygons(data=Valuation %>% filter(ERA == "2016-2022"), 
+              fillColor = ~pal_5(Value),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight=1, 
+              label= paste(Valuation$COMMUNITY, "<br>", "Total Value (M):", Valuation$Value) %>%
+                lapply(htmltools::HTML), 
+              group="2016-2022") %>%
+  addLegend(pal = pal_5, 
+            values = Valuation$Value,
+            opacity = 0.7, 
+            title = paste("Total Value", "<br>", "(Million USD)"),
+            position = "bottomright"
+        ) %>%
+  addLayersControl(overlayGroups = c("2010-2015", "2016-2022"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2016-2022") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+```
+
+```{r, include=FALSE}
+pal_6 <- colorNumeric(
+  palette =  c("#d2d2cb","#594a40"),  
+  domain = Area$SquareFoot
+)
+
+bbox <- st_bbox(City_Geo)   
+Tier1_map4 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Area %>% filter(ERA == "2010-2015"), 
+              fillColor = ~pal_6(SquareFoot),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Area$COMMUNITY, "<br>", "Total SQFT:", Area$SquareFoot) %>%
+                lapply(htmltools::HTML),
+              group="2010-2015") %>%
+  addPolygons(data=Area %>% filter(ERA == "2016-2022"), 
+              fillColor = ~pal_6(SquareFoot),
+              fillOpacity = 1.0,
+              color="#ffffff",
+              weight=1, 
+              label= paste(Area$COMMUNITY, "<br>", "Total SQFT:", Area$SquareFoot) %>%
+                lapply(htmltools::HTML), 
+              group="2016-2022") %>%
+  addLegend(pal = pal_6, 
+            values = Area$SquareFoot,
+            opacity = 0.7, 
+            title = paste("Total SQFT (M)", "<br>", "(Million SQFT)"),
+            position = "bottomright"
+        ) %>%
+  addLayersControl(overlayGroups = c("2010-2015", "2016-2022"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2016-2022") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+```
+
+```{r, echo=FALSE}
+htmltools::browsable(
+  htmltools::tagList(
+    div(style = "display: flex;",
+        div(style = "width: 50%;", Tier1_map3),
+        div(style = "width: 50%;", Tier1_map4)
+    )
+  )
+)
+```
+
+```{r, include=F}
+write.csv(Area %>% st_drop_geometry(), "./data/intermediate/Area.csv")
+write.csv(Valuation %>% st_drop_geometry(), "./data/intermediate/Valuation.csv")
+```
+
+
+It is obvious. From 2010-2015, Westchester and Wholesale District had very large projects completed both in terms of value and square footage (area). Those two neighborhoods continue to have extensive projects completed in the following years, though the differences across neighborhoods are less significant. Neighborhoods such as North Hollywood, Porter Ranch, and Sherman Oaks are experiencing small increases comparing the two time frames, while other areas remain at a similar level. Note that valuation and area illustrated here are an aggregation of all finaled permits / certificate of occupancy, which suggest a high likelihood that those projects are already bringing benefits and opportunities to the communities where they are located in, as oppose to ones that are still pending or issued but projects still under construction. It is also important, however, to recognized the limitation of the data used here, given not all permits have an estimate or an accurate estimate of the valuation and area. The valuation may also be reflecting USD at the time when it completed, and inflation is not accounted for in this situation. 
+
+<br>
+<br>
+
+
+# **Tier 3: Population and Job Growth**
+
+The following maps shows areas of population and job growth according to census estimates.Overall, the population growth has slowed down upon 2015, with many neighborhoods are experiencing population decline, though there is an overall increase in number of permits issued and finaled. Interestingly, from 2016 - 2022, some area, particular towards the central-north area of the city, are experiencing population loss, despite increase in permits and development activities in the same area as shown earlier. In contrast, many neighborhoods have seen growth in job opportunities, especially those neighborhoods towards south-east corridor in the recent years, as well as some central neighborhoods that have been seeing population loss. This may be due to shifts in job hubs and change in spatial commuting pattern. 
+
+## Population Growth
+
+```{r, warning=FALSE, message=FALSE, results='hide', include=FALSE}
+# Census 
+for (i in 2010:2022){
+  df_name = paste0("Pop_", i)
+  assign( df_name, get_acs(
+  geography = "tract",
+  variables = c("B25026_001"),
+  year=i,
+  state=06,
+  county=037,
+  geometry=TRUE
+))
+}
+```
+
+```{r, warning=FALSE, message=FALSE, results='hide', include=FALSE}
+
+# Census Population
+Pop_22 <- get_acs(
+  geography = "tract",
+  variables = c("B25026_001"),
+  year=2022,
+  state=06,
+  county=037,
+  geometry=TRUE
+  ) %>% rename(c( 'pop_2022'= 'estimate')) %>%
+  st_transform(st_crs(Neighborhood))
+
+Pop_21 <- get_acs(
+  geography = "tract",
+  variables = c("B25026_001"),
+  year=2021,
+  state=06,
+  county=037,
+  geometry=TRUE
+  ) %>% rename(c( 'pop_2021'= 'estimate')) %>%
+  st_transform(st_crs(Neighborhood))
+
+Pop_16 <- get_acs(
+  geography = "tract",
+  variables = c("B25026_001"),
+  year=2016,
+  state=06,
+  county=037,
+  geometry=TRUE
+  ) %>% rename(c( 'pop_2016'= 'estimate')) %>%
+  st_transform(st_crs(Neighborhood))
+
+Pop_10 <- get_acs(
+  geography = "tract",
+  variables = c("B25026_001"),
+  year=2010,
+  state=06,
+  county=037,
+  geometry=TRUE
+  )%>% rename(c( 'pop_2010'= 'estimate')) %>%
+    st_transform(st_crs(Neighborhood))
+
+Neighborhood_Pop <- merge(st_join(Neighborhood, Pop_10) %>% group_by(name) %>% summarize(pop_10 = sum(pop_2010)), 
+                          st_join(Neighborhood, Pop_16) %>% group_by(name) %>% summarize(pop_16 = sum(pop_2016)) %>% st_drop_geometry(),
+                          by='name')
+
+Neighborhood_Pop <- merge(Neighborhood_Pop, 
+                          st_join(Neighborhood, Pop_22) %>% group_by(name) %>% summarize(pop_22 = sum(pop_2022)) %>%
+                            st_drop_geometry(),
+                          by='name')
+
+Neighborhood_Pop <- Neighborhood_Pop %>% mutate(
+  Change_10_16 = round((pop_16 - pop_10) / pop_10 * 100, 2),
+  Change_16_22 = round((pop_22 - pop_16) / pop_16 * 100, 2)
+)
+
+
+```
+
+
+```{r, echo=F}
+
+
+combined_values <- c(Neighborhood_Pop$Change_10_16, Neighborhood_Pop$Change_16_22)
+quantiles <- quantile(combined_values, probs = seq(0, 1, length.out = 7))
+pal_7 <- colorBin(
+  palette =  c("#B47C98", "#F2D4E3", "#fffff0", '#A8D0DB',"#409BB4", "#003954"),  
+  bins = quantiles,
+  domain = combined_values
+)
+
+
+bbox <- st_bbox(City_Geo)   
+Tier1_map7 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Neighborhood_Pop %>% select(-pop_10, -pop_16, -pop_22, -Change_16_22), 
+              fillColor = ~pal_7(Change_10_16),
+              fillOpacity = 0.9,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Neighborhood_Pop$name, "<br>", "Pop Change (%):", Neighborhood_Pop$Change_10_16) %>%
+                lapply(htmltools::HTML),
+              group="2010-2016") %>%
+  addPolygons(data=Neighborhood_Pop %>% select(-pop_10, -pop_16, -pop_22, -Change_10_16), 
+              fillColor = ~pal_7(Change_16_22),
+              fillOpacity = 0.9,
+              color="#ffffff",
+              weight=1, 
+              label= paste(Neighborhood_Pop$name, "<br>", "Pop Change (%):", Neighborhood_Pop$Change_16_22) %>%
+                lapply(htmltools::HTML), 
+              group="2016-2022") %>%
+  addLegend(pal = pal_7, 
+            values = combined_values,
+            labFormat = function(type, cuts, p) {paste0(round(cuts[-length(cuts)], 0), " - ", round(cuts[-1], 0))},
+            opacity = 0.7, 
+            title = paste("Population", "<br>" ,"Change (%)"),
+            position = "bottomright"
+        ) %>%
+  addLayersControl(overlayGroups = c("2010-2016", "2016-2022"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2010-2016") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+
+Tier1_map7
+```
+
+## Job Growth
+
+```{r, include=F, message=F, results='hide', warning=F}
+
+# Load Data
+OTM_10 <- read.csv("./data/CensusOTM_CSV/polygon_2010.csv") %>% mutate(GEOID = paste0("0", id)) %>% select(GEOID, c000)
+OTM_16 <- read.csv("./data/CensusOTM_CSV/polygon_2016.csv") %>% mutate(GEOID = paste0("0", id)) %>% select(GEOID, c000)
+OTM_21 <- read.csv("./data/CensusOTM_CSV/polygon_2021.csv") %>% mutate(GEOID = paste0("0", id)) %>% select(GEOID, c000)
+
+# Merge with Tracts GEO
+OTM_10_GEO <- merge(Pop_10 %>% select(GEOID, geometry), OTM_10, by='GEOID' ) %>% rename(c('Jobs_10' = "c000"))
+OTM_16_GEO <- merge(Pop_16 %>% select(GEOID, geometry), OTM_16, by='GEOID' ) %>% rename(c('Jobs_16' = "c000"))
+OTM_21_GEO <- merge(Pop_21 %>% select(GEOID, geometry), OTM_21, by='GEOID' ) %>% rename(c('Jobs_21' = "c000"))
+
+# Join with Neighborhood
+Jobs_10 <- Neighborhood %>% st_join(OTM_10_GEO) %>% 
+  group_by(name) %>% summarize(job_10 = sum(Jobs_10))
+
+Jobs_16 <- Neighborhood %>% st_join(OTM_16_GEO) %>% st_drop_geometry() %>% 
+  group_by(name) %>% summarize(job_16 = sum(Jobs_16))
+
+Jobs_21 <- Neighborhood %>% st_join(OTM_21_GEO) %>% st_drop_geometry() %>% 
+  group_by(name) %>% summarize(job_21 = sum(Jobs_21))
+
+Jobs <- Jobs_10 %>% merge(Jobs_16, by='name') %>% merge(Jobs_21, by='name')
+
+Jobs <- Jobs %>% mutate(
+  Change_10_16 = round((job_16 - job_10) / job_10 * 100, 2),
+  Change_16_21 = round((job_21 - job_16) / job_16 * 100, 2)
+) %>% select(name, Change_10_16, Change_16_21)
+
+```
+
+```{r, include=F}
+
+combined_values_2 <- c(Jobs$Change_10_16, Jobs$Change_16_21)
+quantiles_2 <- quantile(combined_values_2, probs = seq(0, 1, length.out = 6))
+#labels_2 <- paste0(round(quantiles[-length(quantiles)], 0), " - ", round(quantiles[-1], 2))
+#quantile_labels <- paste(round(quantiles_2, 0))
+
+pal_8 <- colorBin(
+  palette = c("#F2D4E3", "#fffff0",'#A8D0DB', "#409BB4", "#003954"),  
+  bins = quantiles_2,
+  domain = combined_values_2
+)
+
+
+bbox <- st_bbox(City_Geo)   
+Tier1_map8 <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=Jobs %>% select(-Change_16_21), 
+              fillColor = ~pal_8(Change_10_16),
+              fillOpacity = 0.9,
+              color="#ffffff",
+              weight = 1,
+              label= ~paste(Jobs$name, "<br>", "Pop Change (%):", Jobs$Change_10_16) %>%
+                lapply(htmltools::HTML),
+              group="2010-2016") %>%
+  addPolygons(data=Jobs %>% select(-Change_10_16), 
+              fillColor = ~pal_8(Change_16_21),
+              fillOpacity = 0.9,
+              color="#ffffff",
+              weight=1, 
+              label= paste(Jobs$name, "<br>", "Pop Change (%):", Jobs$Change_16_21) %>%
+                lapply(htmltools::HTML), 
+              group="2016-2021") %>%
+  addLegend(pal = pal_8, 
+            values = combined_values_2,
+            labFormat = function(type, cuts, p) {
+              paste0(round(cuts[-length(cuts)], 0), " - ", round(cuts[-1], 0))
+            },
+            opacity = 0.7, 
+            title = paste("Jobs", "<br>", "Change (%)"),
+            position = "bottomright") %>%
+  addLayersControl(overlayGroups = c("2010-2016", "2016-2021"),
+                     options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("2010-2016") %>%
+   fitBounds(
+    lng1 = -118.66819, lat1 = 33.70368,
+    lng2 = -118.15537, lat2 = 34.33731
+  )
+```
+
+```{r, echo=F}
+Tier1_map8
+```
+
+```{r, include=F}
+write.csv(Jobs %>% st_drop_geometry(), "./data/intermediate/Jobs.csv")
+write.csv(Neighborhood_Pop, "./data/intermediate/Neighborhood_Pop.csv")
+```
+
+
+<br>
+<br>
+<br>
+<br>
